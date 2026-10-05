@@ -1,0 +1,3 @@
+py-opc-ng
+pyusbiss
+matplotlib

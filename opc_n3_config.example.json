@@ -1,0 +1,16 @@
+{
+  "output_dir": "./data",
+  "poll_interval_seconds": 10,
+  "restart_after_failures": 3,
+  "sensors": [
+    {
+      "sensor_id": "opc_n3_1",
+      "port": "/dev/ttyACM0",
+      "adapter_serial": null,
+      "spi_speed_hz": 500000,
+      "warmup_seconds": 3,
+      "serial_read_timeout_seconds": 1,
+      "serial_write_timeout_seconds": 2
+    }
+  ]
+}
