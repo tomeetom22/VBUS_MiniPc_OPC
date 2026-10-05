@@ -35,7 +35,7 @@ CSV_COLUMNS = ["timestamp_utc", "sensor_id", "port", "record_status", "consecuti
 class SensorConfig:
     # sensor_id distinguishes rows when two or more OPCs share one CSV file.
     sensor_id: str
-    # Windows uses COMx; Linux normally uses /dev/ttyACM*.
+    # Windows uses COMx.
     port: str
     # Optional, permanent identity of the USB-ISS bridge (eight-byte hex serial).
     # If supplied, the logger finds its current COM port automatically.
