@@ -16,7 +16,9 @@ from datetime import datetime
 from pathlib import Path
 
 
-PM_COLUMNS = (("PM1", "pm1_ug_m3"), ("PM2.5", "pm2_5_ug_m3"), ("PM4.25", "pm4_25_ug_m3"), ("PM10", "pm10_ug_m3"))
+# One panel is made for each requested regulatory PM metric.  Sensors are
+# overlaid within each panel so their readings can be compared directly.
+PM_COLUMNS = (("PM1", "pm1_ug_m3"), ("PM2.5", "pm2_5_ug_m3"), ("PM10", "pm10_ug_m3"))
 
 
 def read_measurements(input_dir: Path, requested_sensor: str | None = None) -> dict[str, list[tuple[datetime, dict[str, float]]]]:
@@ -47,17 +49,17 @@ def plot(measurements: dict[str, list[tuple[datetime, dict[str, float]]]], outpu
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
-    figure, axes = plt.subplots(len(measurements), 1, figsize=(13, 4 * len(measurements)), sharex=True, squeeze=False)
-    for axis, (sensor, rows) in zip(axes[:, 0], sorted(measurements.items())):
-        timestamps = [timestamp for timestamp, _ in rows]
-        for label, _column in PM_COLUMNS:
+    figure, axes = plt.subplots(len(PM_COLUMNS), 1, figsize=(13, 10), sharex=True, squeeze=False)
+    for axis, (label, _column) in zip(axes[:, 0], PM_COLUMNS):
+        for sensor, rows in sorted(measurements.items()):
+            timestamps = [timestamp for timestamp, _ in rows]
             values = [pm.get(label, float("nan")) for _, pm in rows]
             if any(value == value for value in values):  # at least one non-NaN value
-                axis.plot(timestamps, values, label=label, linewidth=0.8)
-        axis.set_title(sensor)
-        axis.set_ylabel("PM (µg/m³)")
+                axis.plot(timestamps, values, label=sensor, linewidth=0.8)
+        axis.set_title(label)
+        axis.set_ylabel(f"{label} (µg/m³)")
         axis.grid(True, alpha=0.3)
-        axis.legend(ncol=4)
+        axis.legend(title="Sensor")
     axes[-1, 0].set_xlabel("Timestamp (UTC)")
     axes[-1, 0].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M", tz=measurements[next(iter(measurements))][0][0].tzinfo))
     figure.suptitle("OPC-N3 particulate-matter concentration")
@@ -71,7 +73,7 @@ def plot(measurements: dict[str, list[tuple[datetime, dict[str, float]]]], outpu
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=Path("data"), help="Directory containing opc_n3_YYYY-MM-DD.csv files.")
+    parser.add_argument("--input", type=Path, default=Path("OPC_data/PU_Data"), help="Directory containing opc_n3_YYYY-MM-DD.csv files.")
     parser.add_argument("--output", type=Path, default=Path("plots/opc_pm.png"), help="PNG file to create.")
     parser.add_argument("--sensor", help="Plot only this sensor_id.")
     parser.add_argument("--show", action="store_true", help="Also open the figure window after saving.")

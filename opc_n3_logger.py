@@ -7,10 +7,12 @@ import csv
 import json
 import logging
 import math
+import numbers
 import signal
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -28,7 +30,7 @@ DIAGNOSTIC_FIELDS = {
     "Laser status": "laser_status", "Checksum": "checksum",
 }
 # One row per sensor per polling cycle; failed polls are retained for QA/auditability.
-CSV_COLUMNS = ["timestamp_utc", "sensor_id", "port", "record_status", "consecutive_failures", "recovery_count", "error"] + BIN_COLUMNS + list(DIAGNOSTIC_FIELDS.values())
+CSV_COLUMNS = ["timestamp_utc", "sensor_id", "port", "record_status", "consecutive_failures", "consecutive_zero_pm_polls", "recovery_count", "error"] + BIN_COLUMNS + list(DIAGNOSTIC_FIELDS.values())
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,8 @@ class SensorConfig:
     # Windows uses COMx.
     port: str
     # Optional, permanent identity of the USB-ISS bridge (eight-byte hex serial).
-    # If supplied, the logger finds its current COM port automatically.
+    # Retained for --list-adapters/manual port verification; live polling always
+    # uses this sensor's configured or last-known port without scanning.
     adapter_serial: str | None = None
     spi_speed_hz: int = 500_000
     warmup_seconds: float = 3.0
@@ -51,52 +54,107 @@ class OPCN3Logger:
         self.config, self.restart_after_failures = config, restart_after_failures
         self._device_factory, self._sleep, self.device = device_factory, sleep, None
         self.active_port = config.port
+        # Never synchronously probe every serial port in the polling loop.
+        # The configured port is the initial known port; recovery retains it.
+        self._retry_active_port = True
         # Failure state is kept independently for each configured sensor.
-        self.consecutive_failures = self.last_poll_consecutive_failures = self.recovery_count = 0
+        self.consecutive_failures = self.last_poll_consecutive_failures = 0
+        self.consecutive_zero_pm_polls = self.last_poll_consecutive_zero_pm_polls = 0
+        self.recovery_count = 0
+        self._poll_thread: threading.Thread | None = None
+        self._poll_result: tuple[dict[str, Any] | None, str | None] | None = None
 
-    def connect(self) -> None:
+    def connect(self, *, use_active_port: bool = False) -> None:
         # Construct a fresh USB--SPI connection, then enable N3 laser and fan.
-        self.device = self._device_factory(self.config)
+        # During recovery the current USB-ISS session may not answer the serial
+        # number query used for adapter discovery. Reopen its known COM port
+        # directly instead of probing every port in the polling loop.
+        connection_config = (
+            replace(self.config, port=self.active_port, adapter_serial=None)
+            if use_active_port else self.config
+        )
+        self.device = self._device_factory(connection_config)
         # A serial-matched bridge can have a different COM number than config.port.
-        self.active_port = getattr(self.device, "_logger_port", self.config.port)
+        self.active_port = getattr(self.device, "_logger_port", connection_config.port)
         self.device.on()
         # Let the fan settle before requesting a measurement.
         self._sleep(self.config.warmup_seconds)
 
     def close(self) -> None:
-        if self.device is not None:
+        device, self.device = self.device, None
+        if device is not None:
             try:
-                self.device.off()
+                device.off()
             except Exception:
                 logging.exception("Could not turn off %s", self.config.sensor_id)
-        # A later poll will create a fresh connection instead of reusing this one.
-        self.device = None
+            try:
+                # OPCN3.off() stops the fan and laser but does not close the
+                # USB-ISS serial handle. Windows otherwise retains COM15 and
+                # rejects the fresh connection made during recovery.
+                close_connection = getattr(device, "_logger_close_connection", None)
+                if callable(close_connection):
+                    close_connection()
+            except Exception:
+                logging.exception("Could not close USB-ISS connection for %s", self.config.sensor_id)
 
     def _recover(self) -> None:
         # Software recovery: fan/laser off, short pause, new connection, fan/laser on.
-        # This is triggered only after restart_after_failures failed polls.
-        logging.warning("Recovering %s after %d failed polls", self.config.sensor_id, self.consecutive_failures)
+        # This is triggered after a threshold of failed or all-zero polls.
+        logging.warning("Restarting OPC %s", self.config.sensor_id)
         self.close()
         self._sleep(1)
-        self.connect()
+        self._retry_active_port = True
+        self.connect(use_active_port=True)
+        self._retry_active_port = False
         # Count only completed recovery sequences. The caller resets the poll
         # window even if connect() above raises an exception.
         self.recovery_count += 1
 
+    @staticmethod
+    def _has_all_zero_pm_counts(reading: dict[str, Any]) -> bool:
+        """Return true only when every N3 particle-count bin is numeric zero."""
+        values = [reading.get(f"Bin {i}") for i in range(24)]
+        return all(
+            isinstance(value, numbers.Real) and not isinstance(value, bool)
+            and math.isfinite(value) and value == 0
+            for value in values
+        )
+
     def poll(self) -> tuple[dict[str, Any] | None, str | None]:
         try:
             if self.device is None:
-                self.connect()
+                self.connect(use_active_port=self._retry_active_port)
             # histogram() requests all bins, PM values, and N3 diagnostics in one response.
             reading = self.device.histogram()
             if not isinstance(reading, dict) or not reading:
                 raise RuntimeError("empty or malformed histogram response")
             # Any good reading clears the consecutive-failure counter.
             self.consecutive_failures = self.last_poll_consecutive_failures = 0
-            return reading, None
+            if not self._has_all_zero_pm_counts(reading):
+                self.consecutive_zero_pm_polls = self.last_poll_consecutive_zero_pm_polls = 0
+                return reading, None
+
+            self.consecutive_zero_pm_polls += 1
+            self.last_poll_consecutive_zero_pm_polls = self.consecutive_zero_pm_polls
+            if self.consecutive_zero_pm_polls < self.restart_after_failures:
+                return reading, None
+
+            error = f"all PM count bins were zero for {self.consecutive_zero_pm_polls} consecutive polls; OPC restarted"
+            logging.warning("Recovering %s after %d consecutive all-zero PM-count polls", self.config.sensor_id, self.consecutive_zero_pm_polls)
+            try:
+                self._recover()
+            except Exception as recovery_exc:
+                error += f"; recovery failed: {type(recovery_exc).__name__}: {recovery_exc}"
+                logging.exception("Recovery failed for %s", self.config.sensor_id)
+            finally:
+                # As with failed polls, require a fresh run of N zero readings
+                # before attempting another recovery.
+                self.consecutive_zero_pm_polls = 0
+            return reading, error
         except Exception as exc:
             self.consecutive_failures += 1
             self.last_poll_consecutive_failures = self.consecutive_failures
+            self.consecutive_zero_pm_polls = self.last_poll_consecutive_zero_pm_polls = 0
             error = f"{type(exc).__name__}: {exc}"
             logging.exception("Poll failed for %s", self.config.sensor_id)
             # Default threshold is N=3; set restart_after_failures in the JSON config.
@@ -112,6 +170,36 @@ class OPCN3Logger:
                     # last_poll_consecutive_failures remains N for this CSV row.
                     self.consecutive_failures = 0
             return None, error
+
+    def start_poll(self) -> bool:
+        """Start one poll in a daemon thread; false means a prior poll is stuck."""
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return False
+        self._poll_result = None
+
+        def poll_in_background() -> None:
+            self._poll_result = self.poll()
+
+        self._poll_thread = threading.Thread(
+            target=poll_in_background,
+            name=f"opc-poll-{self.config.sensor_id}",
+            daemon=True,
+        )
+        self._poll_thread.start()
+        return True
+
+    def finish_poll(self, timeout_seconds: float) -> tuple[dict[str, Any] | None, str | None]:
+        """Return the poll result, or a timeout without blocking other sensors."""
+        if self._poll_thread is None:
+            raise RuntimeError("poll was not started")
+        self._poll_thread.join(timeout_seconds)
+        if self._poll_thread.is_alive():
+            return None, f"poll timed out after {timeout_seconds:g} seconds"
+        result = self._poll_result
+        self._poll_thread = None
+        if result is None:
+            return None, "poll stopped without returning a result"
+        return result
 
 
 def create_opcn3(config: SensorConfig) -> Any:
@@ -134,6 +222,9 @@ def create_opcn3(config: SensorConfig) -> Any:
     device = opcng.OPCN3(spi)
     # Preserve the actual port for the CSV when automatic COM-port resolution is used.
     device._logger_port = port
+    # pyusbiss SPI owns an open USB-ISS/pyserial connection. OPCN3.off() only
+    # switches off the OPC peripherals, so retain its close method for recovery.
+    device._logger_close_connection = spi._usbiss.close
     return device
 
 
@@ -211,7 +302,9 @@ def normalize_reading(sensor: OPCN3Logger, reading: dict[str, Any] | None, error
     row = {column: "" for column in CSV_COLUMNS}
     row.update(timestamp_utc=utc_timestamp(), sensor_id=sensor.config.sensor_id, port=sensor.active_port,
                record_status="ok" if reading is not None else "poll_failed",
-               consecutive_failures=sensor.last_poll_consecutive_failures, recovery_count=sensor.recovery_count, error=error or "")
+               consecutive_failures=sensor.last_poll_consecutive_failures,
+               consecutive_zero_pm_polls=sensor.last_poll_consecutive_zero_pm_polls,
+               recovery_count=sensor.recovery_count, error=error or "")
     if reading:
         # The N3 histogram uses "Bin 0" through "Bin 23" as its source names.
         for i, column in enumerate(BIN_COLUMNS): row[column] = safe_value(reading.get(f"Bin {i}"))
@@ -244,18 +337,20 @@ def console_summary(row: dict[str, Any]) -> str:
     return f"{prefix}  " + "  ".join(values)
 
 
-def load_config(path: Path) -> tuple[list[SensorConfig], float, int, Path]:
+def load_config(path: Path) -> tuple[list[SensorConfig], float, float, int, Path]:
     data = json.loads(path.read_text(encoding="utf-8"))
     sensors = [SensorConfig(**item) for item in data["sensors"]]
     if not sensors or len({sensor.sensor_id for sensor in sensors}) != len(sensors):
         raise ValueError("config needs sensors with unique sensor_id values")
     # N=3 by default: after three back-to-back bad polls, attempt N3 recovery.
-    interval, failures = float(data.get("poll_interval_seconds", 5)), int(data.get("restart_after_failures", 3))
-    if interval < 2.5 or failures < 1: raise ValueError("poll interval must be at least 2.5; failures at least 1")
-    return sensors, interval, failures, Path(data.get("output_dir", "data"))
+    interval, timeout = float(data.get("poll_interval_seconds", 5)), float(data.get("poll_timeout_seconds", 8))
+    failures = int(data.get("restart_after_failures", 3))
+    if interval < 2.5 or timeout <= 0 or failures < 1:
+        raise ValueError("poll interval must be at least 2.5; poll timeout and failures must be positive")
+    return sensors, interval, timeout, failures, Path(data.get("output_dir", "data"))
 
 
-def run(sensors: list[OPCN3Logger], interval: float, output_dir: Path, once: bool = False) -> None:
+def run(sensors: list[OPCN3Logger], interval: float, poll_timeout: float, output_dir: Path, once: bool = False) -> None:
     stopping = False
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal stopping
@@ -264,15 +359,24 @@ def run(sensors: list[OPCN3Logger], interval: float, output_dir: Path, once: boo
     signal.signal(signal.SIGINT, stop); signal.signal(signal.SIGTERM, stop)
     try:
         while not stopping:
-            started = time.monotonic()
-            # Poll sensors serially. Each becomes an independent row in the daily CSV.
-            rows = [normalize_reading(sensor, *sensor.poll()) for sensor in sensors]
+            cycle_started = time.monotonic()
+            # Start all sensor polls together so one stalled USB bridge cannot
+            # prevent a working sensor from being measured.
+            poll_started = {sensor: sensor.start_poll() for sensor in sensors}
+            deadline = time.monotonic() + poll_timeout
+            results = []
+            for sensor in sensors:
+                if poll_started[sensor]:
+                    results.append(sensor.finish_poll(max(0, deadline - time.monotonic())))
+                else:
+                    results.append((None, "previous poll is still running; sensor is temporarily skipped"))
+            rows = [normalize_reading(sensor, *result) for sensor, result in zip(sensors, results)]
             append_rows(output_dir, rows)
             for row in rows:
                 print(console_summary(row), flush=True)
             if once: break
             # Maintain the requested cadence after accounting for communication time.
-            time.sleep(max(0, interval - (time.monotonic() - started)))
+            time.sleep(max(0, interval - (time.monotonic() - cycle_started)))
     finally:
         # Best-effort N3 shutdown on normal exit or Ctrl+C.
         for sensor in sensors: sensor.close()
@@ -292,8 +396,8 @@ def main() -> int:
             logging.error("Install dependencies: python -m pip install -r requirements.txt")
             return 2
     try:
-        configs, interval, failures, output_dir = load_config(args.config)
-        run([OPCN3Logger(item, failures, create_opcn3) for item in configs], interval, output_dir, args.once)
+        configs, interval, poll_timeout, failures, output_dir = load_config(args.config)
+        run([OPCN3Logger(item, failures, create_opcn3) for item in configs], interval, poll_timeout, output_dir, args.once)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
         logging.error("%s", exc); return 2
     return 0

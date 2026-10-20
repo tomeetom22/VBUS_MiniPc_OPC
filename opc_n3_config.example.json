@@ -1,6 +1,7 @@
 {
   "output_dir": "./data",
   "poll_interval_seconds": 10,
+  "poll_timeout_seconds": 8,
   "restart_after_failures": 3,
   "sensors": [
     {
