@@ -9,6 +9,7 @@ import logging
 import math
 import numbers
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,10 @@ DIAGNOSTIC_FIELDS = {
 }
 # One row per sensor per polling cycle; failed polls are retained for QA/auditability.
 CSV_COLUMNS = ["timestamp_utc", "sensor_id", "port", "record_status", "consecutive_failures", "consecutive_zero_pm_polls", "recovery_count", "error"] + BIN_COLUMNS + list(DIAGNOSTIC_FIELDS.values())
+# Opening a USB-ISS to query its hardware serial changes the adapter's command
+# state.  Never let the two sensor threads probe the same set of COM ports at
+# the same time.
+ADAPTER_DISCOVERY_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -40,8 +45,8 @@ class SensorConfig:
     # Windows uses COMx.
     port: str
     # Optional, permanent identity of the USB-ISS bridge (eight-byte hex serial).
-    # Retained for --list-adapters/manual port verification; live polling always
-    # uses this sensor's configured or last-known port without scanning.
+    # Immutable physical identity of the USB-ISS bridge.  When provided, it is
+    # used to locate the adapter at startup and as a recovery fallback.
     adapter_serial: str | None = None
     spi_speed_hz: int = 500_000
     warmup_seconds: float = 3.0
@@ -50,19 +55,25 @@ class SensorConfig:
 
 
 class OPCN3Logger:
-    def __init__(self, config: SensorConfig, restart_after_failures: int, device_factory: Callable[[SensorConfig], Any], sleep: Callable[[float], None] = time.sleep) -> None:
+    def __init__(self, config: SensorConfig, restart_after_failures: int, device_factory: Callable[[SensorConfig], Any], sleep: Callable[[float], None] = time.sleep, windows_pnp_reset_on_timeout: bool = False) -> None:
         self.config, self.restart_after_failures = config, restart_after_failures
         self._device_factory, self._sleep, self.device = device_factory, sleep, None
         self.active_port = config.port
-        # Never synchronously probe every serial port in the polling loop.
-        # The configured port is the initial known port; recovery retains it.
-        self._retry_active_port = True
+        # When configured, the USB-ISS serial is the physical identity and is
+        # used at startup.  Later reconnects start with the last known COM
+        # port, avoiding repeated scans during normal polling.
+        self._retry_active_port = not bool(config.adapter_serial)
         # Failure state is kept independently for each configured sensor.
         self.consecutive_failures = self.last_poll_consecutive_failures = 0
         self.consecutive_zero_pm_polls = self.last_poll_consecutive_zero_pm_polls = 0
         self.recovery_count = 0
         self._poll_thread: threading.Thread | None = None
         self._poll_result: tuple[dict[str, Any] | None, str | None] | None = None
+        self._windows_pnp_reset_on_timeout = windows_pnp_reset_on_timeout
+        self._pnp_reset_attempted_for_poll = False
+        self._pnp_reset_in_progress = False
+        self._last_pnp_reset_result = ""
+        self._consecutive_stuck_polls = 0
 
     def connect(self, *, use_active_port: bool = False) -> None:
         # Construct a fresh USB--SPI connection, then enable N3 laser and fan.
@@ -104,7 +115,28 @@ class OPCN3Logger:
         self.close()
         self._sleep(1)
         self._retry_active_port = True
-        self.connect(use_active_port=True)
+        try:
+            # Fast, low-risk path: reconnect the COM port that was working for
+            # this sensor.  Do not scan other ports unless that has failed.
+            self.connect(use_active_port=True)
+        except Exception as known_port_exc:
+            if not self.config.adapter_serial:
+                raise
+            # A Windows USB re-enumeration can change COM15 to another number.
+            # In that specific case, identify the bridge by its immutable USB-ISS
+            # serial.  Close a partly-open connection before probing ports.
+            logging.warning(
+                "Could not reconnect %s on %s; trying USB-ISS serial %s",
+                self.config.sensor_id, self.active_port, self.config.adapter_serial,
+            )
+            self.close()
+            try:
+                self.connect(use_active_port=False)
+            except Exception as serial_scan_exc:
+                raise RuntimeError(
+                    f"known port {self.active_port} failed ({known_port_exc}); "
+                    f"USB-ISS serial fallback also failed ({serial_scan_exc})"
+                ) from serial_scan_exc
         self._retry_active_port = False
         # Count only completed recovery sequences. The caller resets the poll
         # window even if connect() above raises an exception.
@@ -176,6 +208,8 @@ class OPCN3Logger:
         if self._poll_thread is not None and self._poll_thread.is_alive():
             return False
         self._poll_result = None
+        self._pnp_reset_attempted_for_poll = False
+        self._consecutive_stuck_polls = 0
 
         def poll_in_background() -> None:
             self._poll_result = self.poll()
@@ -194,12 +228,82 @@ class OPCN3Logger:
             raise RuntimeError("poll was not started")
         self._poll_thread.join(timeout_seconds)
         if self._poll_thread.is_alive():
-            return None, f"poll timed out after {timeout_seconds:g} seconds"
+            error = f"poll timed out after {timeout_seconds:g} seconds"
+            if self._windows_pnp_reset_on_timeout and not self._pnp_reset_attempted_for_poll:
+                self._pnp_reset_attempted_for_poll = True
+                if self._request_windows_pnp_restart():
+                    error += f"; requested Windows PnP restart for {self.active_port}"
+            return None, error
         result = self._poll_result
         self._poll_thread = None
         if result is None:
             return None, "poll stopped without returning a result"
         return result
+
+    def skipped_stuck_poll(self) -> tuple[None, str]:
+        """Report a still-running timed-out poll and periodically retry PnP reset."""
+        # The old value (often 3) describes the poll that started recovery, not
+        # this skipped cycle. Do not repeat it indefinitely in later CSV rows.
+        self.last_poll_consecutive_failures = 0
+        self.last_poll_consecutive_zero_pm_polls = 0
+        self._consecutive_stuck_polls += 1
+        error = f"previous poll is still running; sensor is temporarily skipped (stuck cycle {self._consecutive_stuck_polls})"
+        if self._windows_pnp_reset_on_timeout and self._consecutive_stuck_polls % self.restart_after_failures == 0:
+            if self._request_windows_pnp_restart():
+                error += f"; requested Windows PnP restart for {self.active_port}"
+        if self._last_pnp_reset_result:
+            error += f"; Windows PnP reset {self._last_pnp_reset_result}"
+        return None, error
+
+    def _request_windows_pnp_restart(self) -> bool:
+        """Request a PnP reset without allowing it to stall other sensors."""
+        if self._pnp_reset_in_progress:
+            return False
+        self._pnp_reset_in_progress = True
+        self._last_pnp_reset_result = "in progress"
+
+        def restart_in_background() -> None:
+            try:
+                restart_windows_serial_port(self.active_port)
+                self._last_pnp_reset_result = f"succeeded for {self.active_port}"
+                logging.warning("Windows PnP restart requested for %s", self.active_port)
+            except Exception:
+                self._last_pnp_reset_result = f"failed for {self.active_port}; see logger traceback"
+                logging.exception("Windows PnP restart failed for %s", self.active_port)
+            finally:
+                self._pnp_reset_in_progress = False
+
+        threading.Thread(
+            target=restart_in_background,
+            name=f"opc-pnp-reset-{self.config.sensor_id}",
+            daemon=True,
+        ).start()
+        return True
+
+
+def restart_windows_serial_port(port: str) -> None:
+    """Restart a COM-port device by its PnP instance ID; requires elevation."""
+    if sys.platform != "win32":
+        raise RuntimeError("Windows PnP reset is only available on Windows")
+    # Configured COM names are controlled values, but quote defensively for
+    # the PowerShell CIM filter.
+    escaped_port = port.replace("'", "''")
+    lookup = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         f"$device = Get-CimInstance Win32_SerialPort -Filter \"DeviceID = '{escaped_port}'\"; if ($null -eq $device) {{ exit 3 }}; $device.PNPDeviceID"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    instance_id = lookup.stdout.strip()
+    if lookup.returncode or not instance_id:
+        detail = lookup.stderr.strip() or f"COM port {port} was not found"
+        raise RuntimeError(detail)
+    restart = subprocess.run(
+        ["pnputil", "/restart-device", instance_id],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if restart.returncode:
+        detail = restart.stderr.strip() or restart.stdout.strip() or "pnputil returned a non-zero status"
+        raise RuntimeError(detail)
 
 
 def create_opcn3(config: SensorConfig) -> Any:
@@ -258,17 +362,20 @@ def resolve_adapter_port(config: SensorConfig) -> str:
     if not config.adapter_serial:
         return config.port
     expected = config.adapter_serial.strip().upper()
-    # Check the prior COM number first, then scan other currently available ports.
-    candidates = [config.port] + [port for port in available_serial_ports() if port != config.port]
-    for port in candidates:
-        try:
-            if read_adapter_serial(port) == expected:
-                if port != config.port:
-                    logging.warning("%s moved from %s to %s", config.sensor_id, config.port, port)
-                return port
-        except Exception:
-            # Non-USB-ISS ports and unplugged ports are not this configured adapter.
-            continue
+    # Check the prior COM number first, then scan other currently available
+    # ports.  Serialise discovery so two OPC polling threads cannot talk to
+    # the same USB-ISS simultaneously.
+    with ADAPTER_DISCOVERY_LOCK:
+        candidates = [config.port] + [port for port in available_serial_ports() if port != config.port]
+        for port in candidates:
+            try:
+                if read_adapter_serial(port) == expected:
+                    if port != config.port:
+                        logging.warning("%s moved from %s to %s", config.sensor_id, config.port, port)
+                    return port
+            except Exception:
+                # Non-USB-ISS ports and unplugged ports are not this configured adapter.
+                continue
     raise RuntimeError(f"Could not find USB-ISS adapter serial {expected} for {config.sensor_id}")
 
 
@@ -337,7 +444,7 @@ def console_summary(row: dict[str, Any]) -> str:
     return f"{prefix}  " + "  ".join(values)
 
 
-def load_config(path: Path) -> tuple[list[SensorConfig], float, float, int, Path]:
+def load_config(path: Path) -> tuple[list[SensorConfig], float, float, int, bool, Path]:
     data = json.loads(path.read_text(encoding="utf-8"))
     sensors = [SensorConfig(**item) for item in data["sensors"]]
     if not sensors or len({sensor.sensor_id for sensor in sensors}) != len(sensors):
@@ -347,7 +454,7 @@ def load_config(path: Path) -> tuple[list[SensorConfig], float, float, int, Path
     failures = int(data.get("restart_after_failures", 3))
     if interval < 2.5 or timeout <= 0 or failures < 1:
         raise ValueError("poll interval must be at least 2.5; poll timeout and failures must be positive")
-    return sensors, interval, timeout, failures, Path(data.get("output_dir", "data"))
+    return sensors, interval, timeout, failures, bool(data.get("windows_pnp_reset_on_timeout", False)), Path(data.get("output_dir", "data"))
 
 
 def run(sensors: list[OPCN3Logger], interval: float, poll_timeout: float, output_dir: Path, once: bool = False) -> None:
@@ -369,7 +476,7 @@ def run(sensors: list[OPCN3Logger], interval: float, poll_timeout: float, output
                 if poll_started[sensor]:
                     results.append(sensor.finish_poll(max(0, deadline - time.monotonic())))
                 else:
-                    results.append((None, "previous poll is still running; sensor is temporarily skipped"))
+                    results.append(sensor.skipped_stuck_poll())
             rows = [normalize_reading(sensor, *result) for sensor, result in zip(sensors, results)]
             append_rows(output_dir, rows)
             for row in rows:
@@ -396,8 +503,8 @@ def main() -> int:
             logging.error("Install dependencies: python -m pip install -r requirements.txt")
             return 2
     try:
-        configs, interval, poll_timeout, failures, output_dir = load_config(args.config)
-        run([OPCN3Logger(item, failures, create_opcn3) for item in configs], interval, poll_timeout, output_dir, args.once)
+        configs, interval, poll_timeout, failures, pnp_reset, output_dir = load_config(args.config)
+        run([OPCN3Logger(item, failures, create_opcn3, windows_pnp_reset_on_timeout=pnp_reset) for item in configs], interval, poll_timeout, output_dir, args.once)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, RuntimeError) as exc:
         logging.error("%s", exc); return 2
     return 0
