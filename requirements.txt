@@ -1,3 +1,4 @@
 py-opc-ng
 pyusbiss
 matplotlib
+certifi

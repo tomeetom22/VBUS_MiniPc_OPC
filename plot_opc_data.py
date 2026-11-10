@@ -5,7 +5,8 @@ Examples:
     python plot_opc_data.py
     python plot_opc_data.py --input data --output plots/pm.png --show
     python plot_opc_data.py --sensor opc_n3_2
-    python plot_opc_data.py --hawthorne
+    python plot_opc_data.py --no-hawthorne
+    python plot_opc_data.py --start 2026-10-27
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import ssl
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,12 +27,14 @@ from zoneinfo import ZoneInfo
 PM_COLUMNS = (("PM1", "pm1_ug_m3"), ("PM2.5", "pm2_5_ug_m3"), ("PM10", "pm10_ug_m3"))
 HAWTHORNE_LABEL = "Hawthorne (Utah DAQ)"
 HAWTHORNE_URL = "https://air.utah.gov/csvFeed.php?id=slc"
+DEFAULT_TALL_TOWER_INPUT = Path("/Users/tomw/Documents/VBUS/LEMSv3/Data/FleetBlock_Data/TallTower/AQ_TT")
+TALL_TOWER_LABEL_PREFIX = "Tall Tower — "
 LOCAL_TIMEZONE = ZoneInfo("America/Denver")
 # Hawthorne/Salt Lake City; used only for the daylight-background calculation.
 LOCAL_LATITUDE, LOCAL_LONGITUDE = 40.7608, -111.8910
 
 
-def read_measurements(input_dir: Path, requested_sensor: str | None = None) -> dict[str, list[tuple[datetime, dict[str, float]]]]:
+def read_measurements(input_dir: Path, requested_sensor: str | None = None, label_prefix: str = "") -> dict[str, list[tuple[datetime, dict[str, float]]]]:
     measurements: dict[str, list[tuple[datetime, dict[str, float]]]] = defaultdict(list)
     for path in sorted(input_dir.glob("opc_n3_*.csv")):
         with path.open(newline="", encoding="utf-8") as handle:
@@ -44,13 +48,17 @@ def read_measurements(input_dir: Path, requested_sensor: str | None = None) -> d
                 except (KeyError, ValueError):
                     continue
                 if pm:
-                    measurements[sensor].append((timestamp, pm))
+                    measurements[f"{label_prefix}{sensor}"].append((timestamp, pm))
     return measurements
 
 
 def read_hawthorne_measurements(url: str = HAWTHORNE_URL) -> list[tuple[datetime, dict[str, float]]]:
     """Read Utah DAQ's hourly Hawthorne PM2.5/PM10 measurements in UTC."""
-    with urlopen(url, timeout=15) as response:
+    # certifi supplies a current CA bundle when a locally installed Python has
+    # no usable system certificate store (a common macOS Python.org setup).
+    import certifi
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    with urlopen(url, timeout=15, context=ssl_context) as response:
         text = response.read().decode("utf-8-sig")
     rows = csv.DictReader(text.splitlines(), delimiter="\t")
     measurements = []
@@ -83,6 +91,17 @@ def measurement_time_range(measurements: dict[str, list[tuple[datetime, dict[str
     if not timestamps:
         raise ValueError("No successful PM measurements found.")
     return min(timestamps), max(timestamps)
+
+
+def parse_utc_start(value: str) -> datetime:
+    """Parse an ISO-8601 date/time, treating a date or naive time as UTC."""
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "start must be an ISO date/time, for example 2026-10-27 or 2026-10-27T12:00:00Z"
+        ) from exc
+    return timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(timezone.utc)
 
 
 def average_measurements(measurements: dict[str, list[tuple[datetime, dict[str, float]]]], minutes: int) -> dict[str, list[tuple[datetime, dict[str, float]]]]:
@@ -165,7 +184,8 @@ def plot(measurements: dict[str, list[tuple[datetime, dict[str, float]]]], outpu
     import matplotlib.dates as mdates
 
     # Hawthorne data is filtered to this same interval before plotting, but use
-    # the OPC interval explicitly so it can never expand the horizontal range.
+    # the combined local-OPC interval explicitly so it can never expand the
+    # horizontal range.
     opc_measurements = {sensor: rows for sensor, rows in measurements.items() if sensor != HAWTHORNE_LABEL}
     start, end = measurement_time_range(opc_measurements)
     figure, axes = plt.subplots(len(PM_COLUMNS), 1, figsize=(13, 10), sharex=True, squeeze=False)
@@ -197,21 +217,41 @@ def plot(measurements: dict[str, list[tuple[datetime, dict[str, float]]]], outpu
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default="/Users/tomw/Documents/VBUS/LEMSv3/Data/FleetBlock_Data/PopUp/AQ", help="Directory containing opc_n3_YYYY-MM-DD.csv files.")
+    parser.add_argument("--tall-tower-input", type=Path, default=DEFAULT_TALL_TOWER_INPUT, metavar="DIR", help="Tall Tower OPC CSV directory to overlay (default: %(default)s).")
+    parser.add_argument("--no-tall-tower", action="store_true", help="Do not overlay Tall Tower OPC data.")
     parser.add_argument("--output", type=Path, default=Path("plots/opc_pm.png"), help="PNG file to create.")
     parser.add_argument("--sensor", metavar="SENSOR_ID", help="Plot only this sensor_id (for example, --sensor opc_n3_1).")
-    parser.add_argument("--hawthorne", action="store_true", help="Overlay hourly PM2.5 and PM10 from Utah DAQ's Hawthorne site.")
+    parser.add_argument("--start", type=parse_utc_start, metavar="ISO_DATE", help="Plot data at or after this UTC date/time (for example, 2026-10-27).")
+    parser.add_argument("--no-hawthorne", action="store_true", help="Do not overlay hourly PM2.5 and PM10 from Utah DAQ's Hawthorne site.")
     parser.add_argument("--average-minutes", type=int, default=30, metavar="MINUTES", help="Time-bin mean for each series (default: 30).")
     parser.add_argument("--show", action="store_true", help="Also open the figure window after saving.")
     args = parser.parse_args()
     try:
         measurements = read_measurements(args.input, args.sensor)
-        if args.hawthorne:
-            start, end = measurement_time_range(measurements)
-            hawthorne = [(timestamp, pm) for timestamp, pm in read_hawthorne_measurements() if start <= timestamp <= end]
-            if hawthorne:
-                measurements[HAWTHORNE_LABEL] = hawthorne
-            else:
-                print("Warning: no Hawthorne measurements overlap the OPC time range.")
+        if not args.no_tall_tower:
+            # Keep site labels distinct even though both loggers use the same
+            # opc_n3_1/opc_n3_2 sensor IDs.  Do not clip the Tower archive to
+            # the PopUp archive: a requested later range may exist only at the
+            # Tower site.
+            measurements.update(read_measurements(args.tall_tower_input, args.sensor, TALL_TOWER_LABEL_PREFIX))
+        if args.start:
+            measurements = {
+                sensor: [(timestamp, pm) for timestamp, pm in rows if timestamp >= args.start]
+                for sensor, rows in measurements.items()
+            }
+            measurements = {sensor: rows for sensor, rows in measurements.items() if rows}
+        start, end = measurement_time_range(measurements)
+        if not args.no_hawthorne:
+            try:
+                hawthorne = [(timestamp, pm) for timestamp, pm in read_hawthorne_measurements() if start <= timestamp <= end]
+                if hawthorne:
+                    measurements[HAWTHORNE_LABEL] = hawthorne
+                else:
+                    print("Warning: no Hawthorne measurements overlap the primary input time range.")
+            except (OSError, ValueError) as exc:
+                # A network or feed outage should not prevent plotting local
+                # OPC data; make the missing comparison explicit instead.
+                print(f"Warning: could not load Hawthorne comparison data: {exc}")
         plot(average_measurements(measurements, args.average_minutes), args.output, args.show)
     except (OSError, ValueError, ModuleNotFoundError) as exc:
         print(f"Error: {exc}")
